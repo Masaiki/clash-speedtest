@@ -16,6 +16,7 @@ import (
 	"github.com/faceair/clash-speedtest/output"
 	"github.com/faceair/clash-speedtest/speedtester"
 	"github.com/faceair/clash-speedtest/tui"
+	"github.com/metacubex/mihomo/component/resolver"
 	mihomolog "github.com/metacubex/mihomo/log"
 	"gopkg.in/yaml.v2"
 )
@@ -53,11 +54,13 @@ var (
 	fastMode          = flag.Bool("fast", false, "fast mode (alias for --speed-mode fast)")
 	versionFlag       = flag.Bool("v", false, "show version information")
 	userAgent         = flag.String("ua", "", "User-Agent for fetching config from http(s) URL (default: clash.meta/v{mihomo module version})")
+	ipv6Mode          = flag.String("ipv6", "auto", "ipv6 resolution when proxy server is a domain: auto (detect local public ipv6), on (force AAAA), off (A only)")
 )
 
 func main() {
 	flag.Parse()
 	mihomolog.SetLevel(mihomolog.SILENT)
+	applyIPv6Mode(*ipv6Mode)
 
 	// Handle version flag
 	if *versionFlag {
@@ -198,6 +201,23 @@ func main() {
 			log.Fatalf("save config file failed: %s", err)
 		}
 		fmt.Printf("\nsave config file to: %s\n", *outputPath)
+	}
+}
+
+// applyIPv6Mode sets resolver.DisableIPv6 from the --ipv6 flag. Only affects
+// resolving a proxy's domain server locally; the test target is resolved by
+// the proxy remotely. "auto" detects a routable local IPv6 address so pure
+// IPv4 hosts don't waste time on doomed AAAA dials.
+func applyIPv6Mode(mode string) {
+	switch strings.TrimSpace(mode) {
+	case "", "auto":
+		resolver.DisableIPv6 = !speedtester.HasPublicIPv6()
+	case "on", "true", "yes", "enable":
+		resolver.DisableIPv6 = false
+	case "off", "false", "no", "disable":
+		resolver.DisableIPv6 = true
+	default:
+		log.Fatalf("invalid --ipv6 %q: use auto, on, or off", mode)
 	}
 }
 

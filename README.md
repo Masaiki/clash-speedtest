@@ -45,6 +45,8 @@ Usage of clash-speedtest:
         configuration file path, also support http(s) url
   -ua string
         User-Agent for fetching config from http(s) URL (default: clash.meta/v{mihomo module version})
+  -ipv6 string
+        ipv6 resolution when proxy server is a domain: auto (detect local public ipv6), on (force AAAA), off (A only) (default "auto")
   -f string
         filter proxies by name, use regexp (default ".*")
   -b string
