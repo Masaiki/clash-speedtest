@@ -31,6 +31,13 @@ func (f resultFilter) Match(result *speedtester.Result) bool {
 	if result == nil {
 		return false
 	}
+	// Failed probes report Latency=0 and PacketLoss=100; never export them.
+	if result.Latency <= 0 {
+		return false
+	}
+	if result.PacketLoss >= 100 {
+		return false
+	}
 	if f.maxLatency > 0 && result.Latency > f.maxLatency {
 		return false
 	}

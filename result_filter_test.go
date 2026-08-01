@@ -85,6 +85,24 @@ func TestResultFilterMatch(t *testing.T) {
 			t.Fatalf("expected nil result to fail")
 		}
 	})
+
+	t.Run("rejects failed latency probes", func(t *testing.T) {
+		result := validResult()
+		result.Latency = 0
+		result.PacketLoss = 100
+		if baseFilter.Match(result) {
+			t.Fatalf("expected zero-latency failed probe to fail")
+		}
+
+		filter := baseFilter
+		filter.maxPacketLoss = 100
+		result = validResult()
+		result.Latency = 0
+		result.PacketLoss = 100
+		if filter.Match(result) {
+			t.Fatalf("expected 100%% packet loss to fail even when max-packet-loss is 100")
+		}
+	})
 }
 
 func TestEarlyStopperShouldContinue(t *testing.T) {
