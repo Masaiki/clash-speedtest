@@ -17,6 +17,9 @@ func TestResolveServerTarget(t *testing.T) {
 		if target.baseURL != "https://example.com" {
 			t.Fatalf("expected baseURL to be trimmed, got %q", target.baseURL)
 		}
+		if target.downloadURL != "https://example.com/__down?bytes=0" {
+			t.Fatalf("expected latency downloadURL, got %q", target.downloadURL)
+		}
 	})
 
 	t.Run("download server with trailing slash", func(t *testing.T) {
@@ -29,6 +32,9 @@ func TestResolveServerTarget(t *testing.T) {
 		}
 		if target.baseURL != "https://example.com" {
 			t.Fatalf("expected baseURL to be trimmed, got %q", target.baseURL)
+		}
+		if target.downloadURL != "https://example.com/__down?bytes=0" {
+			t.Fatalf("expected latency downloadURL, got %q", target.downloadURL)
 		}
 	})
 

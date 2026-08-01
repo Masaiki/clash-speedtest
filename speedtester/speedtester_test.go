@@ -1,6 +1,7 @@
 package speedtester
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -78,14 +79,14 @@ func TestResultFormatErrors(t *testing.T) {
 }
 
 func TestDeduplicateProxies(t *testing.T) {
-	t.Run("deduplicate by server and port", func(t *testing.T) {
+	t.Run("deduplicate identical identity", func(t *testing.T) {
 		proxies := map[string]*CProxy{
-			"proxy-a": {Config: map[string]any{"server": "1.1.1.1", "port": 443}},
-			"proxy-b": {Config: map[string]any{"server": "1.1.1.1", "port": "443"}},
-			"proxy-c": {Config: map[string]any{"server": "2.2.2.2", "port": float64(443)}},
+			"proxy-a": {Config: map[string]any{"type": "ss", "server": "1.1.1.1", "port": 443, "password": "p"}},
+			"proxy-b": {Config: map[string]any{"type": "ss", "server": "1.1.1.1", "port": "443", "password": "p"}},
+			"proxy-c": {Config: map[string]any{"type": "ss", "server": "2.2.2.2", "port": float64(443), "password": "p"}},
 		}
 
-		results := deduplicateProxiesByServerPort(proxies)
+		results := deduplicateProxies(proxies)
 		if len(results) != 2 {
 			t.Fatalf("expected 2 proxies after deduplication, got %d", len(results))
 		}
@@ -104,13 +105,25 @@ func TestDeduplicateProxies(t *testing.T) {
 		}
 	})
 
-	t.Run("mapped ipv6 and ipv4 are deduplicated after normalization", func(t *testing.T) {
+	t.Run("same server port different credentials stay", func(t *testing.T) {
 		proxies := map[string]*CProxy{
-			"proxy-a": {Config: map[string]any{"server": convertMappedIPv6ToIPv4("::ffff:1.1.1.1"), "port": 443}},
-			"proxy-b": {Config: map[string]any{"server": "1.1.1.1", "port": 443}},
+			"proxy-a": {Config: map[string]any{"type": "vmess", "server": "1.1.1.1", "port": 443, "uuid": "aaa"}},
+			"proxy-b": {Config: map[string]any{"type": "vmess", "server": "1.1.1.1", "port": 443, "uuid": "bbb"}},
 		}
 
-		results := deduplicateProxiesByServerPort(proxies)
+		results := deduplicateProxies(proxies)
+		if len(results) != 2 {
+			t.Fatalf("expected 2 proxies with different credentials, got %d", len(results))
+		}
+	})
+
+	t.Run("mapped ipv6 and ipv4 are deduplicated after normalization", func(t *testing.T) {
+		proxies := map[string]*CProxy{
+			"proxy-a": {Config: map[string]any{"type": "ss", "server": convertMappedIPv6ToIPv4("::ffff:1.1.1.1"), "port": 443, "password": "p"}},
+			"proxy-b": {Config: map[string]any{"type": "ss", "server": "1.1.1.1", "port": 443, "password": "p"}},
+		}
+
+		results := deduplicateProxies(proxies)
 		if len(results) != 1 {
 			t.Fatalf("expected 1 proxy after deduplication, got %d", len(results))
 		}
@@ -123,9 +136,31 @@ func TestDeduplicateProxies(t *testing.T) {
 			"proxy-c": {Config: map[string]any{"port": 80}},
 		}
 
-		results := deduplicateProxiesByServerPort(proxies)
+		results := deduplicateProxies(proxies)
 		if len(results) != 3 {
 			t.Fatalf("expected proxies to remain when server or port missing, got %d", len(results))
 		}
 	})
+}
+
+func TestDefaultFetchConfigUA(t *testing.T) {
+	ua := DefaultFetchConfigUA()
+	if !strings.HasPrefix(ua, "clash.meta/v") {
+		t.Fatalf("expected UA prefix clash.meta/v, got %q", ua)
+	}
+	version := strings.TrimPrefix(ua, "clash.meta/v")
+	if version == "" {
+		t.Fatalf("expected non-empty mihomo version in UA, got %q", ua)
+	}
+	st, err := New(&Config{
+		ServerURL:    "https://example.com",
+		DownloadSize: 1,
+		Concurrent:   1,
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	if got := st.fetchConfigUA(); got != ua {
+		t.Fatalf("expected default UA %q, got %q", ua, got)
+	}
 }

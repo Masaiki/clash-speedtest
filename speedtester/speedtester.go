@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,9 +19,17 @@ import (
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/provider"
+	mihomohttp "github.com/metacubex/mihomo/component/http"
 	"github.com/metacubex/mihomo/constant"
 	"gopkg.in/yaml.v2"
 )
+
+const (
+	mihomoModulePath  = "github.com/metacubex/mihomo"
+	maxConfigBodySize = 128 << 20 // 128 MiB
+)
+
+var configHTTPClient = &http.Client{Timeout: 2 * time.Minute}
 
 type Config struct {
 	ConfigPaths      string
@@ -37,7 +46,7 @@ type Config struct {
 	MinUploadSpeed   float64
 	Mode             SpeedMode
 	OutputPath       string
-	UserAgent        string // optional; empty means use default (mihomo kernel UA)
+	UserAgent        string // optional; empty means DefaultFetchConfigUA()
 }
 
 type serverMode int
@@ -47,16 +56,37 @@ const (
 	serverModeDirectDownload
 )
 
-// defaultFetchConfigUA returns the default User-Agent (mihomo kernel format) when none is set.
-func defaultFetchConfigUA() string {
-	return constant.MihomoName + "/" + constant.Version
+// DefaultFetchConfigUA returns clash.meta/v{mihomo module version} for airport compatibility.
+func DefaultFetchConfigUA() string {
+	return "clash.meta/v" + mihomoModuleVersion()
+}
+
+func mihomoModuleVersion() string {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, dep := range bi.Deps {
+			if dep.Path == mihomoModulePath {
+				version := strings.TrimSpace(dep.Version)
+				if version == "" || version == "(devel)" {
+					break
+				}
+				return strings.TrimPrefix(version, "v")
+			}
+		}
+	}
+	// Fallback when build info is unavailable (e.g. some test binaries).
+	return strings.TrimPrefix(constant.Version, "v")
 }
 
 func (st *SpeedTester) fetchConfigUA() string {
 	if st.config.UserAgent != "" {
 		return st.config.UserAgent
 	}
-	return defaultFetchConfigUA()
+	return DefaultFetchConfigUA()
+}
+
+// ApplyFetchUA sets UA for both direct config fetch and mihomo provider HTTP.
+func (st *SpeedTester) ApplyFetchUA() {
+	mihomohttp.SetUA(st.fetchConfigUA())
 }
 
 func (st *SpeedTester) fetchHTTPConfig(targetURL string) ([]byte, error) {
@@ -65,12 +95,22 @@ func (st *SpeedTester) fetchHTTPConfig(targetURL string) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", st.fetchConfigUA())
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := configHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("fetch config %s returned status %s", targetURL, resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxConfigBodySize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxConfigBodySize {
+		return nil, fmt.Errorf("fetch config %s: body exceeds %d bytes", targetURL, maxConfigBodySize)
+	}
+	return body, nil
 }
 
 type serverTarget struct {
@@ -147,9 +187,11 @@ func resolveServerTarget(rawURL string) (*serverTarget, error) {
 	hasQuery := parsed.RawQuery != ""
 	hasFragment := parsed.Fragment != ""
 	if !hasPath && !hasQuery && !hasFragment {
+		baseURL := strings.TrimRight(trimmed, "/")
 		return &serverTarget{
-			mode:    serverModeDownloadServer,
-			baseURL: strings.TrimRight(trimmed, "/"),
+			mode:        serverModeDownloadServer,
+			baseURL:     baseURL,
+			downloadURL: baseURL + "/__down?bytes=0", // used by latency probes
 		}, nil
 	}
 	return &serverTarget{
@@ -174,10 +216,14 @@ func (st *SpeedTester) LoadProxies() (map[string]*CProxy, error) {
 	st.blockedNodeCount = 0
 
 	for configPath := range strings.SplitSeq(st.config.ConfigPaths, ",") {
+		configPath = strings.TrimSpace(configPath)
+		if configPath == "" {
+			continue
+		}
 		var body []byte
 		var err error
-		if strings.HasPrefix(configPath, "http") {
-			body, err = st.fetchHTTPConfig(strings.TrimSpace(configPath))
+		if strings.HasPrefix(configPath, "http://") || strings.HasPrefix(configPath, "https://") {
+			body, err = st.fetchHTTPConfig(configPath)
 			if err != nil {
 				log.Printf("failed to fetch config: %s", err)
 				continue
@@ -194,7 +240,11 @@ func (st *SpeedTester) LoadProxies() (map[string]*CProxy, error) {
 			Proxies: []map[string]any{},
 		}
 		if err := yaml.Unmarshal(body, rawCfg); err != nil {
-			return nil, fmt.Errorf("unable to parse config at path %s: %w, body: %s", configPath, err, body)
+			preview := string(body)
+			if len(preview) > 512 {
+				preview = preview[:512] + "..."
+			}
+			return nil, fmt.Errorf("unable to parse config at path %s: %w, body: %s", configPath, err, preview)
 		}
 		proxies := make(map[string]*CProxy)
 		proxiesConfig := rawCfg.Proxies
@@ -203,11 +253,13 @@ func (st *SpeedTester) LoadProxies() (map[string]*CProxy, error) {
 		for i, config := range proxiesConfig {
 			proxy, err := adapter.ParseProxy(config)
 			if err != nil {
-				return nil, fmt.Errorf("proxy %d: %w", i, err)
+				log.Printf("skip proxy %d: %s", i, err)
+				continue
 			}
 
 			if _, exist := proxies[proxy.Name()]; exist {
-				return nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name())
+				log.Printf("skip duplicate proxy name: %s", proxy.Name())
+				continue
 			}
 			proxies[proxy.Name()] = &CProxy{Proxy: proxy, Config: config}
 		}
@@ -217,14 +269,20 @@ func (st *SpeedTester) LoadProxies() (map[string]*CProxy, error) {
 			}
 			pd, err := provider.ParseProxyProvider(name, config)
 			if err != nil {
-				return nil, fmt.Errorf("parse proxy provider %s error: %w", name, err)
+				log.Printf("parse proxy provider %s error: %s", name, err)
+				continue
 			}
 			if err := pd.Initial(); err != nil {
 				log.Printf("initial proxy provider %s error: %s", pd.Name(), err)
 				continue
 			}
 
-			body, err = st.fetchHTTPConfig(config["url"].(string))
+			providerURL, _ := config["url"].(string)
+			if providerURL == "" {
+				log.Printf("proxy provider %s missing url", name)
+				continue
+			}
+			body, err = st.fetchHTTPConfig(providerURL)
 			if err != nil {
 				log.Printf("failed to fetch config: %s", err)
 				continue
@@ -233,14 +291,23 @@ func (st *SpeedTester) LoadProxies() (map[string]*CProxy, error) {
 				Proxies: []map[string]any{},
 			}
 			if err := yaml.Unmarshal(body, pdRawCfg); err != nil {
-				return nil, fmt.Errorf("unable to parse config: %w, body: %s", err, body)
+				preview := string(body)
+				if len(preview) > 512 {
+					preview = preview[:512] + "..."
+				}
+				log.Printf("unable to parse provider %s config: %s, body: %s", name, err, preview)
+				continue
 			}
 			pdProxies := make(map[string]map[string]any)
 			for _, pdProxy := range pdRawCfg.Proxies {
 				if pdProxy["name"] == nil || pdProxy["server"] == nil {
 					continue
 				}
-				pdProxies[pdProxy["name"].(string)] = pdProxy
+				pdName, ok := pdProxy["name"].(string)
+				if !ok {
+					continue
+				}
+				pdProxies[pdName] = pdProxy
 			}
 			for _, proxy := range pd.Proxies() {
 				proxies[fmt.Sprintf("[%s] %s", name, proxy.Name())] = &CProxy{
@@ -257,8 +324,10 @@ func (st *SpeedTester) LoadProxies() (map[string]*CProxy, error) {
 			default:
 				continue
 			}
-			if server, ok := p.Config["server"]; ok {
-				p.Config["server"] = convertMappedIPv6ToIPv4(server.(string))
+			if p.Config != nil {
+				if server, ok := p.Config["server"].(string); ok {
+					p.Config["server"] = convertMappedIPv6ToIPv4(server)
+				}
 			}
 			if _, ok := allProxies[k]; !ok {
 				allProxies[k] = p
@@ -297,10 +366,10 @@ func (st *SpeedTester) LoadProxies() (map[string]*CProxy, error) {
 			filteredProxies[name] = allProxies[name]
 		}
 	}
-	return deduplicateProxiesByServerPort(filteredProxies), nil
+	return deduplicateProxies(filteredProxies), nil
 }
 
-func deduplicateProxiesByServerPort(proxies map[string]*CProxy) map[string]*CProxy {
+func deduplicateProxies(proxies map[string]*CProxy) map[string]*CProxy {
 	if len(proxies) < 2 {
 		return proxies
 	}
@@ -308,7 +377,7 @@ func deduplicateProxiesByServerPort(proxies map[string]*CProxy) map[string]*CPro
 	deduplicated := make(map[string]*CProxy, len(proxies))
 	seen := make(map[string]struct{}, len(proxies))
 	for name, proxy := range proxies {
-		key, ok := buildProxyServerPortKey(proxy)
+		key, ok := buildProxyIdentityKey(proxy)
 		if ok {
 			if _, exists := seen[key]; exists {
 				continue
@@ -320,7 +389,9 @@ func deduplicateProxiesByServerPort(proxies map[string]*CProxy) map[string]*CPro
 	return deduplicated
 }
 
-func buildProxyServerPortKey(proxy *CProxy) (string, bool) {
+// buildProxyIdentityKey fingerprints node credentials, not only server:port,
+// so shared-entry nodes with different uuid/password/path stay distinct.
+func buildProxyIdentityKey(proxy *CProxy) (string, bool) {
 	if proxy == nil || proxy.Config == nil {
 		return "", false
 	}
@@ -337,18 +408,51 @@ func buildProxyServerPortKey(proxy *CProxy) (string, bool) {
 	if port == "" {
 		return "", false
 	}
-	return fmt.Sprintf("%s:%s", server, port), true
+
+	parts := []string{
+		fmt.Sprintf("%v", proxy.Config["type"]),
+		server,
+		port,
+		fmt.Sprintf("%v", proxy.Config["uuid"]),
+		fmt.Sprintf("%v", proxy.Config["password"]),
+		fmt.Sprintf("%v", proxy.Config["cipher"]),
+		fmt.Sprintf("%v", proxy.Config["protocol"]),
+		fmt.Sprintf("%v", proxy.Config["obfs"]),
+		fmt.Sprintf("%v", proxy.Config["network"]),
+		fmt.Sprintf("%v", proxy.Config["path"]),
+		fmt.Sprintf("%v", proxy.Config["host"]),
+		fmt.Sprintf("%v", proxy.Config["sni"]),
+		fmt.Sprintf("%v", proxy.Config["servername"]),
+		fmt.Sprintf("%v", proxy.Config["flow"]),
+		fmt.Sprintf("%v", proxy.Config["client-fingerprint"]),
+		fmt.Sprintf("%v", proxy.Config["ports"]),
+		fmt.Sprintf("%v", proxy.Config["mport"]),
+		fmt.Sprintf("%v", proxy.Config["auth"]),
+		fmt.Sprintf("%v", proxy.Config["username"]),
+		fmt.Sprintf("%v", proxy.Config["private-key"]),
+		fmt.Sprintf("%v", proxy.Config["public-key"]),
+		fmt.Sprintf("%v", proxy.Config["token"]),
+	}
+	return strings.Join(parts, "|"), true
 }
 
 func (st *SpeedTester) TestProxies(proxies map[string]*CProxy, tester func(result *Result)) {
-	st.TestProxiesUntil(proxies, func(result *Result) bool {
+	st.TestProxiesUntil(context.Background(), proxies, func(result *Result) bool {
 		tester(result)
 		return true
 	})
 }
 
-func (st *SpeedTester) TestProxiesUntil(proxies map[string]*CProxy, tester func(result *Result) bool) {
+func (st *SpeedTester) TestProxiesUntil(ctx context.Context, proxies map[string]*CProxy, tester func(result *Result) bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for name, proxy := range proxies {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		if !tester(st.testProxy(name, proxy)) {
 			return
 		}

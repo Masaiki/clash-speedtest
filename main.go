@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -51,7 +52,7 @@ var (
 	renameTemplate    = flag.String("rename-template", "", "name template for renaming (Go text/template). Placeholders: {{.Flag}}, {{.CountryCode}}, {{.Index}}, {{.Direction}}, {{.Speed}}, {{.SpeedUnit}}, {{.LatencyMs}}, {{.DownloadSpeedMBps}}, {{.UploadSpeedMBps}}. Empty = default format")
 	fastMode          = flag.Bool("fast", false, "fast mode (alias for --speed-mode fast)")
 	versionFlag       = flag.Bool("v", false, "show version information")
-	userAgent         = flag.String("ua", "", "User-Agent for fetching config from http(s) URL (default: mihomo kernel UA, e.g. mihomo/1.10.0)")
+	userAgent         = flag.String("ua", "", "User-Agent for fetching config from http(s) URL (default: clash.meta/v{mihomo module version})")
 )
 
 func main() {
@@ -97,6 +98,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("create speed tester failed: %s", err)
 	}
+	speedTester.ApplyFetchUA()
 	effectiveMode := speedTester.Mode()
 	resultFilter := newResultFilter(effectiveMode)
 	stopper, err := newEarlyStopper(*earlyStop, resultFilter)
@@ -128,10 +130,12 @@ func main() {
 		resultChannel := make(chan *speedtester.Result, len(allProxies))
 		resultsDone := make(chan struct{})
 		saveResult := make(chan error, 1)
+		testCtx, cancelTest := context.WithCancel(context.Background())
+		defer cancelTest()
 
 		// Start testing in goroutine to send results to channel
 		go func() {
-			speedTester.TestProxiesUntil(allProxies, func(result *speedtester.Result) bool {
+			speedTester.TestProxiesUntil(testCtx, allProxies, func(result *speedtester.Result) bool {
 				if collectResults {
 					results = append(results, result)
 				}
@@ -160,6 +164,7 @@ func main() {
 		if _, err := p.Run(); err != nil {
 			log.Fatalf("TUI failed: %s", err)
 		}
+		cancelTest()
 
 		if !collectResults {
 			return
@@ -174,7 +179,7 @@ func main() {
 	}
 
 	// TSV mode: collect results synchronously
-	speedTester.TestProxiesUntil(allProxies, func(result *speedtester.Result) bool {
+	speedTester.TestProxiesUntil(context.Background(), allProxies, func(result *speedtester.Result) bool {
 		results = append(results, result)
 
 		if tsvWriter != nil {
